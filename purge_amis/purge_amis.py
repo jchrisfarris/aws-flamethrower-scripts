@@ -43,7 +43,7 @@ def main(args, logger):
             ec2_client = session.client("ec2", region_name=a['Region'])
             size = delete_ami_and_snapshot(ec2_client, a)
             if size != False:  # delete_ami_and_snapshot() returns false on any errors
-                logger.info(f"Deleted {a['ImageId']} ({a['Name']}) in {a['Region']} saving {size}GB")
+                logger.info(f"Deleting {a['ImageId']} ({a['Name']}) in {a['Region']} saves {size}GB")
                 size_deleted += size
 
     if args.actually_do_it:
@@ -131,3 +131,9 @@ if __name__ == '__main__':
         main(args, logger)
     except KeyboardInterrupt:
         exit(1)
+    except ClientError as e:
+        if e.response['Error']['Code'] == "RequestExpired":
+            print("Credentials expired")
+            exit(1)
+        else:
+            raise
