@@ -163,3 +163,9 @@ if __name__ == '__main__':
         main(args, logger)
     except KeyboardInterrupt:
         exit(1)
+    except ClientError as e:
+        if e.response['Error']['Code'] == "RequestExpired":
+            print("Credentials expired")
+            exit(1)
+        else:
+            raise
