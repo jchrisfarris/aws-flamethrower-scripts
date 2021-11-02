@@ -39,22 +39,43 @@ def main(args, logger):
     with open(args.infile, newline='') as csvfile:
         reader = csv.DictReader(csvfile)
         for s in reader:
-            # Create a boto client in the correct region
-            ec2_client = session.client("ec2", region_name=s['Region'])
-            try:
-                if args.actually_do_it:
-                    ec2_client.delete_snapshot(SnapshotId=s['SnapshotId'])
-                    logger.info(f"Deleted {s['SnapshotId']} ({s['Description']}) in {s['Region']}")
-                else:
-                    logger.info(f"Would Delete {s['SnapshotId']} ({s['Description']}) in {s['Region']}")
-                size_deleted += int(s['VolumeSize'])
-            except ClientError as e:
-                if e.response['Error']['Code'] == "InvalidSnapshot.InUse":
-                    logger.error(f"Unable to delete {s['SnapshotId']} - {e}")
-                elif e.response['Error']['Code'] == "InvalidSnapshot.NotFound":
-                    logger.error(f"Unable to find {s['SnapshotId']}")
-                else:
-                    raise
+
+            if s['Type'] == "EBS":
+                # Create a boto client in the correct region
+                ec2_client = session.client("ec2", region_name=s['Region'])
+                try:
+                    if args.actually_do_it:
+                        ec2_client.delete_snapshot(SnapshotId=s['SnapshotId'])
+                        logger.info(f"Deleted {s['SnapshotId']} ({s['Description']}) in {s['Region']}")
+                    else:
+                        logger.info(f"Would Delete {s['SnapshotId']} ({s['Description']}) in {s['Region']}")
+                    size_deleted += int(s['VolumeSize'])
+                except ClientError as e:
+                    if e.response['Error']['Code'] == "InvalidSnapshot.InUse":
+                        logger.error(f"Unable to delete {s['SnapshotId']} - {e}")
+                    elif e.response['Error']['Code'] == "InvalidSnapshot.NotFound":
+                        logger.error(f"Unable to find {s['SnapshotId']}")
+                    else:
+                        raise
+            elif s['Type'] == "RDS":
+                # Create a boto client in the correct region
+                client = session.client("rds", region_name=s['Region'])
+                try:
+                    if args.actually_do_it:
+                        client.delete_db_snapshot(DBSnapshotIdentifier=s['DBSnapshotIdentifier'])
+                        logger.info(f"Deleted {s['DBSnapshotIdentifier']} (from: {s['DBInstanceIdentifier']}) in {s['Region']} Created: {s['SnapshotCreateTime']}")
+                    else:
+                        logger.info(f"Would Delete {s['DBSnapshotIdentifier']} (from: {s['DBInstanceIdentifier']}) in {s['Region']} Created: {s['SnapshotCreateTime']}")
+                    size_deleted += int(s['AllocatedStorage'])
+                except ClientError as e:
+                    if e.response['Error']['Code'] == "InvalidSnapshot.InUse":
+                        logger.error(f"Unable to delete {s['DBSnapshotIdentifier']} - {e}")
+                    elif e.response['Error']['Code'] == "InvalidSnapshot.NotFound":
+                        logger.error(f"Unable to find {s['DBSnapshotIdentifier']}")
+                    else:
+                        raise
+            else:
+                logger.error(f"Invalid Type {s['Type']}")
 
     if args.actually_do_it:
         logger.info(f"Deleted {size_deleted}GB of Snapshots")
@@ -109,3 +130,9 @@ if __name__ == '__main__':
         main(args, logger)
     except KeyboardInterrupt:
         exit(1)
+    except ClientError as e:
+        if e.response['Error']['Code'] == "RequestExpired":
+            print("Credentials expired")
+            exit(1)
+        else:
+            raise

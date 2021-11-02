@@ -28,7 +28,8 @@ import sys
 import pytz
 utc=pytz.UTC
 
-HEADER=["SnapshotId", "Region", "StartTime", "VolumeSize", "State", "Description"]
+EBS_HEADER=["SnapshotId", "Type", "Region", "StartTime", "VolumeSize", "State", "Description"]
+RDS_HEADER=["DBSnapshotIdentifier", "Type", "Region", "SnapshotCreateTime", "AllocatedStorage", "Status", "DBInstanceIdentifier"]
 
 
 def main(args, logger):
@@ -45,35 +46,53 @@ def main(args, logger):
 
     # Get all the Regions for this account
     for region in get_regions(session, args):
-        ec2_client = session.client("ec2", region_name=region)
-
-        snap_list = list_snapshots(ec2_client, region, args)
-        logger.info(f"Found {len(snap_list)} snapshots to cleanup in {region}")
-        for s in snap_list:
-            s['Region'] = region
-            # parse the annoying way AWS returns tags into a proper dict
-            if 'Tags' in s:
-                tags = parse_tags(s['Tags'])
+        if args.type == "EBS":
+            snap_list = list_snapshots(session, region, args)
+            logger.info(f"Found {len(snap_list)} snapshots to cleanup in {region}")
+            csv_header = EBS_HEADER
+            for s in snap_list:
+                s['Region'] = region
+                s['Type'] = "EBS"
+                # parse the annoying way AWS returns tags into a proper dict
+                if 'Tags' in s:
+                    tags = parse_tags(s['Tags'])
+                    for key, value in tags.items():
+                        # we need to capture the list of tag_keys for Dictwriter, but we prepend with "tag." to avoid
+                        # overriding an instance key
+                        if f"tag.{key}" not in tag_keys:
+                            tag_keys.append(f"tag.{key}")
+                        s[f"tag.{key}"] = value  # now add to the instance dict
+                snapshots.append(s)
+        elif args.type == "RDS":
+            snap_list = list_rds_snapshots(session, region, args)
+            logger.info(f"Found {len(snap_list)} snapshots to cleanup in {region}")
+            csv_header = RDS_HEADER
+            for s in snap_list:
+                s['Region'] = region
+                s['Type'] = "RDS"
+                # parse the annoying way AWS returns tags into a proper dict
+                tags = parse_tags(s['TagList'])
                 for key, value in tags.items():
                     # we need to capture the list of tag_keys for Dictwriter, but we prepend with "tag." to avoid
                     # overriding an instance key
                     if f"tag.{key}" not in tag_keys:
                         tag_keys.append(f"tag.{key}")
                     s[f"tag.{key}"] = value  # now add to the instance dict
-
-            snapshots.append(s)
+                snapshots.append(s)
+        else:
+            logger.critical(f"Invalid type: {args.type}. Aborting...")
+            exit(1)
 
     # Now write the final CSV file
     with open(args.outfile, 'w', newline='') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=HEADER + tag_keys, extrasaction='ignore')
+        writer = csv.DictWriter(csvfile, fieldnames=csv_header + tag_keys, extrasaction='ignore')
         writer.writeheader()
         for s in snapshots:
             writer.writerow(s)
-
     exit(0)
 
-
-def list_snapshots(ec2_client, region, args):
+def list_snapshots(session, region, args):
+    ec2_client = session.client("ec2", region_name=region)
     output = []
     response = ec2_client.describe_snapshots(
         OwnerIds=['self'],
@@ -84,6 +103,22 @@ def list_snapshots(ec2_client, region, args):
     for s in response['Snapshots']:
         if s['StartTime'] < threshold_time:
             logger.debug(f"Snapshot {s['SnapshotId']} was created {s['StartTime']}, which is older that {threshold_time}")
+            output.append(s)
+
+    return(output)
+
+def list_rds_snapshots(session, region, args):
+    client = session.client("rds", region_name=region)
+    output = []
+    response = client.describe_db_snapshots(
+        MaxRecords=100,
+        SnapshotType='manual'
+    )
+    threshold_time = utc.localize(dt.datetime.today() - dt.timedelta(days=int(args.older_than_days)))
+    logger.info(f"Looking for Snapshots older than {threshold_time}")
+    for s in response['DBSnapshots']:
+        if s['SnapshotCreateTime'] < threshold_time:
+            logger.debug(f"Snapshot {s['DBSnapshotIdentifier']} was created {s['SnapshotCreateTime']}, which is older that {threshold_time}")
             output.append(s)
 
     return(output)
@@ -165,3 +200,9 @@ if __name__ == '__main__':
         main(args, logger)
     except KeyboardInterrupt:
         exit(1)
+    except ClientError as e:
+        if e.response['Error']['Code'] == "RequestExpired":
+            print("Credentials expired")
+            exit(1)
+        else:
+            raise
