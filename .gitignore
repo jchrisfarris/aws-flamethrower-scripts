@@ -2,6 +2,7 @@
 # Don't commit test files of debug info
 *.csv
 *.json
+*-PreservedStack
 
 # Created by https://www.gitignore.io/api/osx,python
 
