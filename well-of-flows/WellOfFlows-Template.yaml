@@ -1,0 +1,736 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Create a set of queries to find out who or what is talking to an ENI
+# Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+
+  pTargetENI:
+    Description: ENI that you want to create a flow log for
+    Type: String
+    Default: eni-SAMPLE
+
+  pENIIPAddress:
+    Description: IP Address of the ENI
+    Type: String
+    Default: 99.99.99.99
+
+  pBucketName:
+    Description: Bucket for the raw flowlogs and Athena Results
+    Type: String
+
+  pResourcePrefix:
+    Description: Freeform prefix for resources to be created. Should be unique per account/region
+    Type: String
+    # TODO add pattern requirements here
+    # Must be lowercase
+
+  pVPCId:
+    Description: If Set, Flowlogs will be created for the entire VPC, not just an ENI
+    Type: String
+    Default: NONE
+
+Conditions:
+  cFullVPCFlowlog: !Not [ !Equals [ !Ref pVPCId, 'NONE' ] ]
+  cENIFlowLog: !Equals [ !Ref pVPCId, 'NONE' ]
+
+Resources:
+
+  # Create the Bucket and ENI flowlog
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: LogDeliveryWrite
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+      BucketName: !Ref pBucketName
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  EniFlowLog:
+    Type: AWS::EC2::FlowLog
+    Condition: cENIFlowLog
+    DependsOn: Bucket
+    Properties:
+      ResourceId: !Ref pTargetENI
+      ResourceType: NetworkInterface
+      TrafficType: ALL
+      LogDestination: !GetAtt Bucket.Arn
+      LogDestinationType: s3
+      # Fields defined here: https://docs.aws.amazon.com/vpc/latest/userguide/flow-logs.html#flow-logs-fields
+      LogFormat: ${version} ${interface-id} ${instance-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${flow-direction} ${tcp-flags} ${type} ${pkt-srcaddr} ${pkt-dstaddr} ${pkt-src-aws-service} ${pkt-dst-aws-service} ${traffic-path}
+      MaxAggregationInterval: 60 # seconds
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+      # DestinationOptions:
+      #   FileFormat: parquet
+      #   HiveCompatiblePartitions: true
+      #   PerHourPartition: true
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Condition: cFullVPCFlowlog
+    DependsOn: Bucket
+    Properties:
+      ResourceId: !Ref pVPCId
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestination: !GetAtt Bucket.Arn
+      LogDestinationType: s3
+      # Fields defined here: https://docs.aws.amazon.com/vpc/latest/userguide/flow-logs.html#flow-logs-fields
+      LogFormat: ${version} ${interface-id} ${instance-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${flow-direction} ${tcp-flags} ${type} ${pkt-srcaddr} ${pkt-dstaddr} ${pkt-src-aws-service} ${pkt-dst-aws-service} ${traffic-path}
+      # MaxAggregationInterval: 60
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+
+
+  #
+  # Create the Glue and Athena DBs
+  #
+  # creates a glue database for flow logs athena tables.
+  VpcFlowLogsAthenaDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      DatabaseInput:
+        Name: !Sub "${pResourcePrefix}-database"
+      CatalogId: !Ref AWS::AccountId
+
+  # this section creates glue athenaTables mapped to s3 flow logs bucket creates a workgroup in Athena for queries.
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${pResourcePrefix}-workgroup"
+      Description: This workgroup has the queries related to vpc flow logs.
+      State: ENABLED
+      Tags:
+        - Key: "service"
+          Value: "vpc_flow_logs"
+      WorkGroupConfiguration:
+        BytesScannedCutoffPerQuery: 200000000
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        RequesterPaysEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${pBucketName}/results/"
+        EngineVersion:
+          SelectedEngineVersion: 'Athena engine version 2'
+
+  VpcFlowLogsGlueTable:
+    Type: AWS::Glue::Table
+    DependsOn:
+      - VpcFlowLogsAthenaDatabase
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref VpcFlowLogsAthenaDatabase
+      TableInput:
+        Description: This table has the schema for vpc flow logs information.
+        Name: !Sub "${pResourcePrefix}-table"
+        PartitionKeys:
+          - Name: year
+            Type: string
+          - Name: month
+            Type: string
+          - Name: day
+            Type: string
+        TableType: EXTERNAL_TABLE
+        StorageDescriptor:
+          Location:  !Sub "s3://${pBucketName}/AWSLogs/${AWS::AccountId}/vpcflowlogs/${AWS::Region}/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            Parameters:
+              skip.header.line.count: "1"
+              EXTERNAL: "true"
+              field.delim: ' '
+              serialization.format: ' '
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+          # This must match the LogFormat defined in the EC2::FlowLog
+          Columns:
+            - Name: 'version'
+              Type: int
+            - Name: 'interface_id'
+              Type: string
+            - Name: 'instance_id'
+              Type: string
+            - Name: 'srcaddr'
+              Type: string
+            - Name: 'dstaddr'
+              Type: string
+            - Name: 'srcport'
+              Type: int
+            - Name: 'dstport'
+              Type: int
+            - Name: 'protocol'
+              Type: bigint
+            - Name: 'packets'
+              Type: bigint
+            - Name: 'bytes'
+              Type: bigint
+            - Name: 'start'
+              Type: bigint
+            - Name: 'end'
+              Type: bigint
+            - Name: 'action'
+              Type: string
+            - Name: 'flow_direction'
+              Type: string
+            - Name: 'tcp_flags'
+              Type: int
+            - Name: 'type'
+              Type: string
+            - Name: 'pkt_srcaddr'
+              Type: string
+            - Name: 'pkt_dstaddr'
+              Type: string
+            - Name: 'pkt_src_aws_service'
+              Type: string
+            - Name: 'pkt_dst_aws_service'
+              Type: string
+            - Name: 'traffic_path'
+              Type: int
+
+  #
+  # Lambda Glue
+  #
+  # creates an IAM role for lambda function execution permission.
+  VPCFlowLogsAthenaIntegrationLambdaExecutorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: VPCFlowLogsAthenaIntegrationLambdaExecutorPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'glue:GetTable'
+                  - 'glue:CreatePartition'
+                  - 'glue:UpdatePartition'
+                  - 'glue:GetPartition'
+                Resource: "*"
+
+  # creates a lambda function for daily partition creation.
+  PartitionerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - VpcFlowLogsGlueTable
+    Properties:
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const glue = new AWS.Glue();
+
+          exports.handler = async function(event, context) {
+            let db = event.db
+            let confs = event.athena
+            let hive = event.hive
+            let account_id = event.account_id
+            let service = event.service
+            let region = event.region
+            let today = new Date()
+            let errs = []
+
+            for(let i = 0; i < confs.length; i++) {
+              let cnf = confs[i]
+              let tab = cnf['partitionTableName']
+              let frq = cnf['frequency']
+
+              let table = await glue.getTable({
+                DatabaseName: db,
+                Name: tab,
+              }).promise()
+
+              let strgDesc = table.Table['StorageDescriptor']
+              let Values
+
+              if(frq == "hourly"){
+                if(hive == "true") {
+                  Values = ["aws-account-id=" + account_id, "aws-service=" + service, "aws-region=" + region, "year=" + String(today.getFullYear()), "month=" + ("0" + (today.getMonth() + 1)).slice(-2), "day=" + ("0" + today.getDate()).slice(-2), "hour=" + ("0" + today.getHours()).slice(-2)]
+                } else {
+                  Values = [String(today.getFullYear()), ("0" + (today.getMonth() + 1)).slice(-2), ("0" + today.getDate()).slice(-2), ("0" + today.getHours()).slice(-2)]
+                }
+              } else {
+                  if(hive == "true") {
+                    Values = ["aws-account-id=" + account_id, "aws-service=" + service, "aws-region=" + region, "year=" + String(today.getFullYear()), "month=" + ("0" + (today.getMonth() + 1)).slice(-2), "day=" + ("0" + (today.getDate())).slice(-2)]
+                  } else {
+                    Values = [String(today.getFullYear()), ("0" + (today.getMonth() + 1)).slice(-2), ("0" + (today.getDate())).slice(-2)]
+                  }
+              }
+              try {
+                let result = await glue.getPartition({
+                  DatabaseName: db,
+                  TableName: tab,
+                  PartitionValues: Values
+                }).promise()
+              } catch (err) {
+                  if(err.code === 'EntityNotFoundException'){
+                    console.log(strgDesc)
+                    let params = {
+                      DatabaseName: db,
+                      TableName: tab,
+                      PartitionInput: {
+                        StorageDescriptor: {
+                            ...strgDesc,
+                            Location: `${strgDesc.Location}${Values.join('/')}/`
+                        },
+                        Values,
+                      },
+                    }
+                    await glue.createPartition(params).promise()
+                  } else {
+                    errs.push(err)
+                }
+              }
+            }
+
+            return new Promise(function(resolve, reject) { errs.length > 0 ? reject(errs) : resolve("SUCCESS")});
+          }
+      Handler: 'index.handler'
+      Timeout: 30
+      Runtime: nodejs14.x
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt VPCFlowLogsAthenaIntegrationLambdaExecutorRole.Arn
+
+  # creates event rule for daily lambda function trigger
+  ScheduledEventRule:
+    Type: AWS::Events::Rule
+    DependsOn: PartitionerFunction
+    Properties:
+      Description: This event rule will be invoking lambda based on schedule
+      Name: !Sub "${pResourcePrefix}-PartitionScheduledEventRule"
+      ScheduleExpression: cron(0 * * * ? *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PartitionerFunction.Arn
+          Id: Partitioner
+          Input: !Sub |
+            {
+              "db": "${VpcFlowLogsAthenaDatabase}",
+              "hive": "false",
+              "account_id": "${AWS::AccountId}",
+              "service": "vpcflowlogs",
+              "region": "${AWS::Region}",
+              "athena": [
+                {
+                  "partitionTableName": "${pResourcePrefix}-table",
+                  "frequency": "daily"
+                }
+              ]
+            }
+
+  # creates lambda permission for daily schedule
+  ScheduledEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt PartitionerFunction.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledEventRule.Arn
+
+
+  #
+  # Canned Queries
+  #
+  VpcFlowLogsTotalBytesQuery:
+    Type: AWS::Athena::NamedQuery
+    DependsOn:
+      - VpcFlowLogsAthenaDatabase
+      - AthenaWorkGroup
+    Properties:
+      Database: !Ref VpcFlowLogsAthenaDatabase
+      Description: "Top 50 pairs of source and destination IP addresses with the most bytes transferred."
+      Name: Total_Bytes_Transferred_Between_IPAddresses
+      QueryString: !Sub |
+        SELECT SUM(bytes) as totalbytes, srcaddr, dstaddr
+        FROM "${pResourcePrefix}-table"
+        WHERE action = 'ACCEPT'
+        GROUP BY srcaddr, dstaddr
+        ORDER BY totalbytes DESC
+        LIMIT 50
+      WorkGroup: !Ref AthenaWorkGroup
+
+  VpcFlowLogsSshRdpTrafficQuery:
+    Type: AWS::Athena::NamedQuery
+    DependsOn:
+      - VpcFlowLogsAthenaDatabase
+      - AthenaWorkGroup
+    Properties:
+      Database: !Ref VpcFlowLogsAthenaDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      Description: "Monitor SSH and RDP traffic"
+      Name: SSH_RDP_Traffic
+      QueryString: !Sub |
+        SELECT srcaddr, SUM(packets) as packet_count
+        FROM "${pResourcePrefix}-table"
+        WHERE dstport IN (22, 3389)
+        AND flow_direction LIKE 'ingress'
+        AND tcp_flags = 2
+        AND protocol = 6
+        AND "action" = 'ACCEPT'
+        GROUP BY "srcaddr"
+        ORDER BY "packet_count" DESC
+
+  InboundTCPConnectionsQuery:
+    Type: AWS::Athena::NamedQuery
+    DependsOn:
+      - VpcFlowLogsAthenaDatabase
+      - AthenaWorkGroup
+    Properties:
+      Database: !Ref VpcFlowLogsAthenaDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      Description: "Inbound TCP connections to the ENI"
+      Name: Inbound_TCP_Connections
+      QueryString: !Sub |
+        SELECT srcaddr,dstport, SUM(packets) as packet_count
+        FROM "${pResourcePrefix}-table"
+        WHERE flow_direction LIKE 'ingress'
+        AND tcp_flags = 2
+        AND protocol = 6
+        AND "action" = 'ACCEPT'
+        GROUP BY "srcaddr","dstport"
+        ORDER BY "packet_count" DESC
+
+
+  InboundUDPConnectionsQuery:
+    Type: AWS::Athena::NamedQuery
+    DependsOn:
+      - VpcFlowLogsAthenaDatabase
+      - AthenaWorkGroup
+    Properties:
+      Database: !Ref VpcFlowLogsAthenaDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      Description: "Inbound UDP connections to the ENI"
+      Name: Inbound_UDP_Connections
+      QueryString: !Sub |
+        SELECT srcaddr,dstport, SUM(packets) as packet_count
+        FROM "${pResourcePrefix}-table"
+        WHERE flow_direction LIKE 'ingress'
+        AND protocol = 17
+        AND "action" = 'ACCEPT'
+        GROUP BY "srcaddr","dstport"
+        ORDER BY "packet_count" DESC
+
+
+  OutboundTCPConnectionsQuery:
+    Type: AWS::Athena::NamedQuery
+    DependsOn:
+      - VpcFlowLogsAthenaDatabase
+      - AthenaWorkGroup
+    Properties:
+      Database: !Ref VpcFlowLogsAthenaDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      Description: "Inbound TCP connections from the ENI"
+      Name: Outbound_TCP_Connections
+      QueryString: !Sub |
+        SELECT dstaddr,dstport, SUM(packets) as packet_count
+        FROM "${pResourcePrefix}-table"
+        WHERE flow_direction LIKE 'egress'
+        AND tcp_flags = 2
+        AND protocol = 6
+        AND "action" = 'ACCEPT'
+        GROUP BY "dstaddr","dstport"
+        ORDER BY "packet_count" DESC
+
+
+  OutboundUDPConnectionsQuery:
+    Type: AWS::Athena::NamedQuery
+    DependsOn:
+      - VpcFlowLogsAthenaDatabase
+      - AthenaWorkGroup
+    Properties:
+      Database: !Ref VpcFlowLogsAthenaDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      Description: "Outbound UDP connections from the ENI"
+      Name: Outbound_UDP_Connections
+      QueryString: !Sub |
+        SELECT dstaddr,dstport, SUM(packets) as packet_count
+        FROM "${pResourcePrefix}-table"
+        WHERE flow_direction LIKE 'egress'
+        AND protocol = 17
+        AND "action" = 'ACCEPT'
+        GROUP BY "dstaddr","dstport"
+        ORDER BY "packet_count" DESC
+
+
+  TrafficViaVGWQuery:
+    Type: AWS::Athena::NamedQuery
+    DependsOn:
+      - VpcFlowLogsAthenaDatabase
+      - AthenaWorkGroup
+    Properties:
+      Database: !Ref VpcFlowLogsAthenaDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      Description: "Connections from the ENI"
+      Name: Connections_via_VGW
+      QueryString: !Sub |
+        SELECT srcaddr,dstport, SUM(packets) as packet_count
+        FROM "${pResourcePrefix}-table"
+        WHERE srcaddr NOT LIKE '${pENIIPAddress}'
+          AND traffic_path = 3
+          AND "action" = 'ACCEPT'
+        GROUP BY "srcaddr","dstport"
+        ORDER BY "packet_count" DESC
+
+
+  TrafficViaPCXQuery:
+    Type: AWS::Athena::NamedQuery
+    DependsOn:
+      - VpcFlowLogsAthenaDatabase
+      - AthenaWorkGroup
+    Properties:
+      Database: !Ref VpcFlowLogsAthenaDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      Description: "Inbound connections to the ENI"
+      Name: Inbound_Connections_via_VPC_peering
+      QueryString: !Sub |
+        SELECT srcaddr,dstport, SUM(packets) as packet_count
+        FROM "${pResourcePrefix}-table"
+        WHERE srcaddr NOT LIKE '${pENIIPAddress}'
+          AND traffic_path IN (4,5)
+          AND "action" = 'ACCEPT'
+        GROUP BY "srcaddr","dstport"
+        ORDER BY "packet_count" DESC
+
+  # VpcFlowLogsAdminPortTraffic:
+  #   Type: AWS::Athena::NamedQuery
+  #   DependsOn:
+  #     - VpcFlowLogsAthenaDatabase
+  #     - AthenaWorkGroup
+  #   Properties:
+  #     Database: !Ref VpcFlowLogsAthenaDatabase
+  #     Description: "Monitor the traffic on administrative web app ports"
+  #     Name: !Sub "${pResourcePrefix}-VpcFlowLogsAdminPortTraffic"
+  #     QueryString: !Sub >
+  #       SELECT ip, sum(bytes) as total_bytes
+  #       FROM (
+  #       SELECT dstaddr as ip,sum(bytes) as bytes
+  #       FROM "${pResourcePrefix}-table"
+  #       GROUP BY 1
+  #       UNION ALL
+  #       SELECT srcaddr as ip,sum(bytes) as bytes
+  #       FROM "${pResourcePrefix}-table"
+  #       GROUP BY 1
+  #       )
+  #       GROUP BY ip
+  #       ORDER BY total_bytes
+  #       DESC LIMIT 10
+  #     WorkGroup: !Ref AthenaWorkGroup
+
+  VpcFlowLogsRejectedTraffic:
+    Type: AWS::Athena::NamedQuery
+    DependsOn:
+      - VpcFlowLogsAthenaDatabase
+      - AthenaWorkGroup
+    Properties:
+      Database: !Ref VpcFlowLogsAthenaDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      Description: "Recorded traffic which was not permitted by the security groups or network ACLs."
+      Name: Top_25_Rejected_Hosts
+      QueryString: !Sub |
+        SELECT srcaddr, dstaddr,  SUM(packets) as packet_count
+        FROM "${pResourcePrefix}-table"
+        WHERE "action" = 'REJECT'
+        GROUP BY srcaddr, dstaddr
+        ORDER BY packet_count desc
+        LIMIT 25
+
+
+  EgressPathForDestIPQuery:
+    Type: AWS::Athena::NamedQuery
+    DependsOn:
+      - VpcFlowLogsAthenaDatabase
+      - AthenaWorkGroup
+    Properties:
+      Database: !Ref VpcFlowLogsAthenaDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      Description: Export list of Destination Addresses and the VPC Traffic Path Code to the destination
+      Name: Egress_Path_for_Destination_IP
+      QueryString: !Sub |
+        SELECT dstaddr,traffic_path
+        FROM "${pResourcePrefix}-table"
+        WHERE flow_direction LIKE 'egress'
+          AND "action" = 'ACCEPT'
+        GROUP BY "dstaddr","traffic_path"
+
+
+  FlowLogsTrafficFrmSrcAddr:
+    Type: AWS::Athena::NamedQuery
+    Condition: cFullVPCFlowlog
+    DependsOn:
+      - VpcFlowLogsAthenaDatabase
+      - AthenaWorkGroup
+    Properties:
+      Database: !Ref VpcFlowLogsAthenaDatabase
+      Description: "Traffic transmitted from a particular source IP address. Here the source address (srcaddr) is a placeholder"
+      Name: All_Traffic_From_Source_Address
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub |
+        SELECT *
+        FROM "${pResourcePrefix}-table"
+        WHERE srcaddr = '198.51.100.2'
+        ORDER BY "start" ASC
+        LIMIT 50;
+
+  AllTrafficToFromInstanceQuery:
+    Type: AWS::Athena::NamedQuery
+    Condition: cFullVPCFlowlog
+    DependsOn:
+      - VpcFlowLogsAthenaDatabase
+      - AthenaWorkGroup
+    Properties:
+      Database: !Ref VpcFlowLogsAthenaDatabase
+      Description: "Most recent 500 flows to or from a specific instance_id"
+      Name: All_Traffic_To_or_From_InstanceId
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub |
+        SELECT *
+        FROM "${pResourcePrefix}-table"
+        WHERE instance_id='i-CHANGEME'
+        ORDER BY "end" DESC
+        LIMIT 500;
+
+
+  VPCIngressByInstanceIdQuery:
+    Type: AWS::Athena::NamedQuery
+    Condition: cFullVPCFlowlog
+    DependsOn:
+      - VpcFlowLogsAthenaDatabase
+      - AthenaWorkGroup
+    Properties:
+      Database: !Ref VpcFlowLogsAthenaDatabase
+      Description: "All traffic inbound to a specific instance_id"
+      Name: VPC_Ingress_By_InstanceId
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub |
+        SELECT srcaddr, dstport, flow_direction, protocol, traffic_path, tcp_flags, SUM(packets) as packet_count,
+        FROM "${pResourcePrefix}-table"
+        WHERE instance_id='i-CHANGEME'
+        AND flow_direction = 'ingress'
+        AND action = 'ACCEPT'
+        GROUP BY srcaddr,flow_direction,protocol,traffic_path,dstport,tcp_flags
+        ORDER BY "packet_count" DESC
+
+
+  VPCEgressByInstanceIdQuery:
+    Type: AWS::Athena::NamedQuery
+    Condition: cFullVPCFlowlog
+    DependsOn:
+      - VpcFlowLogsAthenaDatabase
+      - AthenaWorkGroup
+    Properties:
+      Database: !Ref VpcFlowLogsAthenaDatabase
+      Description: "All Traffic outbound from a specific instance_id"
+      Name: VPC_Egress_By_InstanceId
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub |
+        SELECT dstaddr, dstport, flow_direction, protocol, traffic_path, tcp_flags, SUM(packets) as packet_count,
+        FROM "${pResourcePrefix}-table"
+        WHERE instance_id='i-CHANGEME'
+        AND flow_direction = 'egress'
+        AND action = 'ACCEPT'
+        GROUP BY dstaddr,flow_direction,protocol,traffic_path,dstport,tcp_flags
+        ORDER BY "packet_count" DESC
+
+
+  UniqeIPsTalkingToInstanceQuery:
+    Type: AWS::Athena::NamedQuery
+    Condition: cFullVPCFlowlog
+    DependsOn:
+      - VpcFlowLogsAthenaDatabase
+      - AthenaWorkGroup
+    Properties:
+      Database: !Ref VpcFlowLogsAthenaDatabase
+      Description: "All Traffic outbound from a specific instance_id"
+      Name: Unique_IPs_Talking_To_Instance
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub |
+        SELECT DISTINCT(srcaddr)
+        FROM "${pResourcePrefix}-table"
+        WHERE instance_id='i-CHANGEME'
+        AND action = 'ACCEPT'
+        AND dstport != 123
+        GROUP BY srcaddr, dstaddr
+        ORDER BY packet_count DESC
+
+  UniqeIPsTalkingToInterfaceQuery:
+    Type: AWS::Athena::NamedQuery
+    Condition: cFullVPCFlowlog
+    DependsOn:
+      - VpcFlowLogsAthenaDatabase
+      - AthenaWorkGroup
+    Properties:
+      Database: !Ref VpcFlowLogsAthenaDatabase
+      Description: "All Traffic outbound from a specific interface_id"
+      Name: Unique_IPs_Talking_To_ENI
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub |
+        SELECT srcaddr, dstaddr, SUM(packets) as packet_count
+        FROM "${pResourcePrefix}-table"
+        WHERE interface_id ='eni-CHANGEME'
+        AND action = 'ACCEPT'
+        AND dstport != 123
+        AND (packets != 1 OR packets != 3)
+        GROUP BY srcaddr, dstaddr
+        ORDER BY packet_count DESC
+
+
+  ActivityByENILast24HrsQuery:
+    Type: AWS::Athena::NamedQuery
+    Condition: cFullVPCFlowlog
+    DependsOn:
+      - VpcFlowLogsAthenaDatabase
+      - AthenaWorkGroup
+    Properties:
+      Database: !Ref VpcFlowLogsAthenaDatabase
+      Description: "Packet count by ENI for the last 24 hrs"
+      Name: Activty_by_ENI_last_24hrs
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub |
+        SELECT interface_id, SUM(packets) as packet_count
+        FROM "${pResourcePrefix}-table"WHERE action = 'ACCEPT'
+        AND dstport != 123
+        AND (packets != 1 OR packets != 3)
+        AND start >= to_unixtime(current_timestamp) - 86400
+        GROUP BY interface_id
+        ORDER BY packet_count DESC
+
+
+# TODO
+# 1) Lambda CW Alarm
+
+Outputs:
+
+  TriggerEvent:
+    Value: !Ref ScheduledEventRule
+    Description: Name of the Scheduled Event used to trigger the Partitioner Lambda
+
+  PartitionerFunction:
+    Value: !Ref PartitionerFunction
+
+
+
